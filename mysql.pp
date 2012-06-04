@@ -202,4 +202,95 @@ define mysql_instance (
 }
 
 
+# Manages MySQL users.
+# a user is specifically a user@hostname.
+# If the permissions for the user@hostname do
+# not match the desired ones here, permissions
+# will be revoked and then the new ones regranted.
+# This ensures that a user will have only the
+# desired permissions.  (The namevar is arbitrary
+# and is used only for uniquely identifying
+# the define when it is used.)
+#
+# Usage:
+#   mysql_user { namevar: user => "'username'@'host',  access =>  "read", password => "encrypted_pw" }
+# Example:
+#   mysql_user { readonly_user:
+#     user     => "'readonly'@'192.168.0.%'",
+#     access   => "read",
+#     password => "xxxxxxxxxx",
+#   }
+#
+#  access has 4 shortcuts defined:
+#   "all"         == ALL PRIVILEGES
+#   "write"       == DELETE, INSERT, SELECT, UPDATE
+#   "read"        == PROCESS, REPLICATION CLIENT, SELECT
+#   "replication" == REPLICATION CLIENT, REPLICATION SLAVE
+#
+# Otherwise, the string you pass in for access will be used as the MySQL permissions to grant.
+# Make SURE that the access string you pass is either one of these shortcuts, OR that
+# it exactly matches the permissions that will be printed out by mk-show-grants once
+# the MySQL user has been created.  This define uses mk-show-grants to
+# check that the specified permissions match what MySQL currently has.  If they don't
+# match exactly, the GRANT statement will be run every puppet run.
+#
+define mysql_user(
+  $ensure       = "present",
+  $socket       = '/var/run/mysql/mysql.sock',
+  $access       = "write",
+  $database     = "*",
+  $user,
+  $password)
+{
+  # default paths for following execs
+  Exec { path => "/bin:/usr/bin" }
+
+  # permission aliases
+  $permissions = $access ? {
+    "all"         => "ALL PRIVILEGES",
+    # if this is global write, give extra permissions
+    "write"       => $database ? {
+      '*'     => "DELETE, EXECUTE, INSERT, PROCESS, REPLICATION CLIENT, SELECT, UPDATE",
+      default => "DELETE, EXECUTE, INSERT, SELECT, UPDATE"
+    },
+    # if this is global read, give extra permissions
+    "read"        => $database ? {
+      '*'     => "EXECUTE, PROCESS, REPLICATION CLIENT, SELECT",
+      default => "EXECUTE, SELECT, UPDATE"
+    },
+    "replication" => "REPLICATION CLIENT, REPLICATION SLAVE",
+    default     => $access,
+  }
+
+
+  # this shell command will return 0 if the mysql user grant we are looking for currently exists.
+  $grant_exists_command = "mk-show-grants --socket ${socket} | grep \"${user}\" | grep \"GRANT ${permissions}\" | grep '`${database}`.\\*'"
+
+  case $ensure {
+    # if we want the MySQL user to be present.
+    "present": {
+      # exec for revoking and granting MySQL user permissions.
+      exec { "mysql_grant_user_${name}":
+        # first attempt to revoke all privileges for this user, then grant the desired permissions.
+        command => "$grant_exists_command && mysql -v --socket ${socket} -e \"REVOKE ${permissions} ON ${database}.* FROM ${user};\"; mysql -v --socket ${socket} -e \"GRANT ${permissions} ON ${database}.* TO ${user} IDENTIFIED BY PASSWORD '${password}';\" &> /tmp/mysql_user_exec.out",
+        # only execute this command if $socket is a socket file
+        onlyif  => "test -S ${socket}",
+        # only execute this if this user does not already have this permission.
+        unless  => $grant_exists_command,
+        require => Package["maatkit"],
+      }
+    }
+    "absent": {
+      # exec for droping the MySQL user
+      exec { "mysql_drop_user_${name}":
+        command => "mysql --socket ${socket} -e \"REVOKE ${permissions} ON ${database}.* FROM ${user}\"",
+        # only execute this if $socket is a socket file AND the user exists.
+        onlyif  => "test -S ${socket} && $grant_exists_command",
+        require => Package["maatkit"],
+      }
+    }
+  }
+
+}
+
 
